@@ -199,6 +199,10 @@ The final ability update blends two approaches:
 
 This ensures the system is both mathematically sound AND feels responsive to the student.
 
+#### Final MLE Re-Estimation
+
+When the session completes, the system performs a **full MLE re-estimation from scratch** using all response data. This produces the most statistically accurate final ability score, separate from the incremental updates during the test. The summary endpoint returns this clean re-estimated value.
+
 #### Question Selection: Maximum Fisher Information
 
 For each unanswered question, we compute **Fisher Information** at the current theta:
