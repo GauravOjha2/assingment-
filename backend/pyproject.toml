@@ -1,0 +1,21 @@
+[project]
+name = "adaptive-diagnostic-engine"
+version = "1.0.0"
+description = "AI-Driven Adaptive Diagnostic Engine for GRE-style assessments"
+requires-python = ">=3.9"
+
+[tool.setuptools]
+packages = ["app"]
+
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "motor>=3.3.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "python-dotenv>=1.0.0",
+    "openai>=1.6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]

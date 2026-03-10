@@ -1,0 +1,652 @@
+# Adaptive Diagnostic Engine - Architecture Documentation
+
+## System Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           ADAPTIVE DIAGNOSTIC ENGINE                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────────┐ │
+│  │                 │     │                 │     │                     │ │
+│  │   Frontend      │◄────│   FastAPI       │◄────│   In-Memory DB      │ │
+│  │   (SPA)         │     │   Backend       │     │   or MongoDB        │ │
+│  │                 │     │                 │     │                     │ │
+│  │  • Landing      │────►│  • Routes       │────►│  • Questions        │ │
+│  │  • Test Flow    │     │  • Models       │     │  • Sessions         │ │
+│  │  • Results      │     │  • Services     │     │                     │ │
+│  │  • Charts       │     │                 │     │                     │ │
+│  └─────────────────┘     └────────┬────────┘     └─────────────────────┘ │
+│                                    │                                       │
+│                                    ▼                                       │
+│                         ┌─────────────────────┐                           │
+│                         │                     │                           │
+│                         │  Adaptive Engine    │                           │
+│                         │  (IRT Algorithm)   │                           │
+│                         │                     │                           │
+│                         │  • Question Select │                           │
+│                         │  • Ability Update  │                           │
+│                         │  • Fisher Info     │                           │
+│                         └─────────────────────┘                           │
+│                                    │                                       │
+│                                    ▼                                       │
+│                         ┌─────────────────────┐                           │
+│                         │                     │                           │
+│                         │  LLM Service        │                           │
+│                         │  (OpenAI GPT-4)     │                           │
+│                         │                     │                           │
+│                         │  • Study Plan Gen   │                           │
+│                         │  • Fallback Rules   │                           │
+│                         └─────────────────────┘                           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Data Flow Architecture
+
+### 1. Request-Response Flow
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         USER STARTS ASSESSMENT                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  POST /api/sessions                                                           │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  Request: { student_name, max_questions }                              │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Database.create_session()                                                   │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  • Generate unique session_id                                          │  │
+│  │  • Initialize current_ability = 0.5                                   │  │
+│  │  • Initialize empty responses array                                    │  │
+│  │  • Set max_questions (default: 10)                                    │  │
+│  │  • Set status = "active"                                              │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Response: { session_id, initial_ability, max_questions }                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2. Question Selection Flow
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    GET /api/sessions/{id}/next-question                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Load Session from Database                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  • Check status == "active"                                           │  │
+│  │  • Check questions_answered < max_questions                           │  │
+│  │  • Get current_ability                                                │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Load All Available Questions                                               │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  • Fetch from questions collection                                    │  │
+│  │  • Exclude already answered questions                                  │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  IRT Question Selection (Fisher Information)                                │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  For each candidate question:                                         │  │
+│  │    1. Calculate P(θ) - probability of correct answer                 │  │
+│  │    2. Calculate Fisher Information I(θ)                              │  │
+│  │    3. Select question with MAX I(θ)                                  │  │
+│  │                                                                     │  │
+│  │  Fisher Information Formula:                                          │  │
+│  │    I(θ) = a² × [(P - c)² / ((1-c)² × P × Q)]                       │  │
+│  │                                                                     │  │
+│  │  Where:                                                              │  │
+│  │    a = discrimination parameter                                       │  │
+│  │    P = P(θ) - probability correct                                    │  │
+│  │    Q = 1 - P                                                         │  │
+│  │    c = guessing parameter                                            │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Return Next Question                                                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  {                                                                    │  │
+│  │    question_id,                                                      │  │
+│  │    question_text,                                                    │  │
+│  │    options: [A, B, C, D],                                           │  │
+│  │    topic,                                                            │  │
+│  │    difficulty,                                                       │  │
+│  │    current_ability                                                   │  │
+│  │  }                                                                   │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3. Answer Submission & Ability Update Flow
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│              POST /api/sessions/{id}/submit-answer                          │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Validate Request                                                            │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  • Verify session exists and is active                               │  │
+│  │  • Verify question exists                                            │  │
+│  │  • Verify question not already answered                              │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Evaluate Answer                                                             │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  is_correct = (selected_answer == correct_answer)                   │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  IRT Ability Update (MLE with Newton-Raphson)                               │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  Step 1: Build response history                                       │  │
+│  │    For each past response:                                           │  │
+│  │      • Get question difficulty, discrimination, guessing              │  │
+│  │      • Record whether answered correctly                              │  │
+│  │                                                                     │  │
+│  │  Step 2: Newton-Raphson Iteration                                    │  │
+│  │    For i = 1 to 15:                                                  │  │
+│  │      • Calculate first derivative ∂L/∂θ (gradient)                  │  │
+│  │      • Calculate second derivative ∂²L/∂θ² (Hessian)                │  │
+│  │      • θ_new = θ - learning_rate × (∂L/∂θ) / (∂²L/∂θ²)            │  │
+│  │      • Apply Bayesian prior (centered at 0.5)                       │  │
+│  │      • Clamp to [0.05, 0.95]                                        │  │
+│  │                                                                     │  │
+│  │  Step 3: Blend with Simple Heuristic                                │  │
+│  │    final_θ = 0.7 × MLE_θ + 0.3 × simple_θ                          │  │
+│  │                                                                     │  │
+│  │  Simple Heuristic:                                                   │  │
+│  │    • Correct + Hard Question → Large ability increase               │  │
+│  │    • Wrong + Easy Question → Large ability decrease                 │  │
+│  │    • Step size decreases as questions answered (convergence)        │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Update Session in Database                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  • current_ability = updated_ability                                  │  │
+│  │  • questions_answered += 1                                          │  │
+│  │  • questions_correct += (1 if is_correct else 0)                     │  │
+│  │  • Push response record to responses array                           │  │
+│  │  • Update topics_performance (per-topic accuracy)                    │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Check Session Completion                                                    │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  If questions_answered >= max_questions:                            │  │
+│  │    • status = "completed"                                           │  │
+│  │    • completed_at = timestamp                                        │  │
+│  │    • Trigger LLM study plan generation                              │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Return Answer Result                                                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  {                                                                    │  │
+│  │    is_correct,                                                       │  │
+│  │    correct_answer,                                                   │  │
+│  │    previous_ability,                                                 │  │
+│  │    updated_ability,                                                  │  │
+│  │    ability_change,                                                  │  │
+│  │    session_complete                                                 │  │
+│  │  }                                                                   │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4. Study Plan Generation Flow
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                 GET /api/sessions/{id}/summary                             │
+│                 (Triggered after session completion)                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Collect Performance Data                                                   │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  • final_ability                                                      │  │
+│  │  • total_correct / total_questions                                    │  │
+│  │  • topics_performance: { topic: {correct, total} }                  │  │
+│  │  • Full response history with timestamps                            │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  LLM Service Call                                                            │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  if OpenAI API Key configured:                                        │  │
+│  │    • Build detailed performance summary                               │  │
+│  │    • Send to GPT-4o-mini with structured prompt                       │  │
+│  │    • Parse JSON response                                             │  │
+│  │    • Return study plan                                               │  │
+│  │  else:                                                               │  │
+│  │    • Use rule-based fallback generator                                │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Store Study Plan                                                            │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  • Update session document with study_plan                           │  │
+│  │  • Set completed_at timestamp                                        │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Return Complete Summary                                                     │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  {                                                                    │  │
+│  │    final_ability,                                                    │  │
+│  │    accuracy_percentage,                                             │  │
+│  │    topics_performance,                                               │  │
+│  │    ability_progression: [θ₀, θ₁, θ₂, ...],                         │  │
+│  │    study_plan: { ... }                                               │  │
+│  │  }                                                                   │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Component Architecture
+
+### Backend Components
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           BACKEND STRUCTURE                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  app/                                                                       │
+│  ├── main.py                     # FastAPI app entry, lifespan, CORS        │
+│  │                                                                          │
+│  ├── core/                                                                    │
+│  │   ├── config.py             # Settings from environment variables       │
+│  │   └── database.py           # MongoDB connection + in-memory fallback  │
+│  │                                                                          │
+│  ├── models/                                                                 │
+│  │   └── models.py             # Pydantic schemas for Question, Session   │
+│  │                                                                          │
+│  ├── schemas/                                                                │
+│  │   └── schemas.py            # API request/response models             │
+│  │                                                                          │
+│  ├── routes/                                                                 │
+│  │   └── routes.py             # API endpoints (7 routes)                │
+│  │                                                                          │
+│  ├── services/                                                             │
+│  │   ├── adaptive_engine.py    # IRT algorithm implementation            │
+│  │   └── llm_service.py       # OpenAI integration + fallback            │
+│  │                                                                          │
+│  └── seed.py                    # Database seeding script                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Frontend Components
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          FRONTEND STRUCTURE                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  index.html                                                                  │
+│  ├── Landing Screen                                                          │
+│  │   ├── Feature cards (3)                                                 │
+│  │   └── Start form (name + question count)                                │
+│  │                                                                          │
+│  ├── Test Screen                                                            │
+│  │   ├── Header (logo, progress, ability)                                  │
+│  │   ├── Progress bar                                                      │
+│  │   ├── Stats row (difficulty, topic, correct, time)                      │
+│  │   ├── Question card                                                     │
+│  │   ├── Feedback card                                                     │
+│  │   └── Ability chart (Canvas)                                            │
+│  │                                                                          │
+│  └── Results Screen                                                         │
+│      ├── Score circle (animated ring)                                       │
+│      ├── Topic performance cards                                            │
+│      ├── Ability progression chart                                          │
+│      ├── Study plan (AI-generated)                                          │
+│      └── Action buttons                                                    │
+│                                                                             │
+│  styles.css                      # Modern dark theme, animations            │
+│                                                                             │
+│  app.js                                                                          │
+│  ├── State management                                                       │
+│  ├── API client (fetch wrappers)                                            │
+│  ├── Screen navigation                                                      │
+│  ├── Question rendering                                                     │
+│  ├── Answer submission                                                      │
+│  ├── Canvas chart rendering                                                 │
+│  └── Study plan display                                                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Database Schema
+
+### Questions Collection
+
+```javascript
+{
+  _id: ObjectId,
+  question_text: String,        // "If 3x + 7 = 22, what is x?"
+  options: [String],            // ["3", "4", "5", "6"]
+  correct_answer: String,       // "5"
+  difficulty: Number,           // 0.1 - 1.0 (IRT b parameter)
+  topic: String,               // "Algebra", "Vocabulary", etc.
+  tags: [String],              // ["linear-equations", "basic"]
+  discrimination: Number,      // 0.1 - 3.0 (IRT a parameter)
+  guessing: Number,           // 0.0 - 0.5 (IRT c parameter)
+  created_at: Date
+}
+
+// Indexes:
+//   { difficulty: 1 }
+//   { topic: 1 }
+//   { difficulty: 1, topic: 1 }
+```
+
+### UserSessions Collection
+
+```javascript
+{
+  _id: ObjectId,
+  student_name: String,
+  status: String,              // "active" | "completed" | "abandoned"
+  
+  // Ability Tracking
+  current_ability: Number,     // Current θ estimate (0.0 - 1.0)
+  initial_ability: Number,     // Starting θ (always 0.5)
+  
+  // Responses
+  responses: [{
+    question_id: String,
+    question_text: String,
+    topic: String,
+    difficulty: Number,
+    selected_answer: String,
+    correct_answer: String,
+    is_correct: Boolean,
+    ability_after: Number,
+    response_time_ms: Number,
+    timestamp: Date
+  }],
+  
+  // Statistics
+  questions_answered: Number,
+  questions_correct: Number,
+  max_questions: Number,
+  
+  // Aggregated Performance
+  topics_performance: {
+    "Algebra": { correct: 2, total: 3 },
+    "Vocabulary": { correct: 0, total: 2 }
+  },
+  
+  // AI Study Plan
+  study_plan: {
+    overall_assessment: String,
+    ability_level: String,
+    strengths: [String],
+    weaknesses: [String],
+    study_plan: [{
+      step: Number,
+      title: String,
+      description: String,
+      focus_topics: [String],
+      recommended_resources: [String],
+      estimated_time: String
+    }],
+    next_test_recommendation: String
+  },
+  
+  // Timestamps
+  started_at: Date,
+  completed_at: Date
+}
+
+// Indexes:
+//   { status: 1 }
+//   { started_at: -1 }
+```
+
+---
+
+## API Endpoints
+
+| Method | Endpoint | Description | Request Body | Response |
+|--------|----------|-------------|--------------|----------|
+| `GET` | `/api/health` | Health check | - | `{status, database, version}` |
+| `POST` | `/api/sessions` | Start new session | `{student_name, max_questions?}` | `{session_id, initial_ability, max_questions}` |
+| `GET` | `/api/sessions` | List all sessions | - | `[Session, ...]` |
+| `GET` | `/api/sessions/{id}/next-question` | Get next question | - | `{question, current_ability, session_complete}` |
+| `POST` | `/api/sessions/{id}/submit-answer` | Submit answer | `{session_id, question_id, selected_answer, response_time_ms?}` | `{is_correct, updated_ability, session_complete}` |
+| `GET` | `/api/sessions/{id}/summary` | Get results & study plan | - | `{final_ability, accuracy, topics_performance, study_plan}` |
+| `GET` | `/api/questions` | List all questions | - | `[Question, ...]` |
+
+---
+
+## IRT Algorithm Deep Dive
+
+### The 3-Parameter Logistic (3PL) Model
+
+The probability of a student with ability θ answering item i correctly:
+
+```
+P(θ) = c + (1 - c) / (1 + exp(-a × (θ - b)))
+```
+
+Where:
+- **θ (theta)** - Student ability parameter (estimated by the system)
+- **b** - Item difficulty parameter
+- **a** - Item discrimination parameter  
+- **c** - Pseudo-guessing parameter
+
+### Ability Estimation (MLE)
+
+After each response, we update θ using Maximum Likelihood Estimation:
+
+1. **Log-likelihood function**: L(θ) = Σ[yᵢ log P(θ) + (1-yᵢ) log(1-P(θ))]
+2. **First derivative** (gradient): ∂L/∂θ
+3. **Second derivative** (Hessian): ∂²L/∂θ²
+4. **Update rule**: θ_new = θ - learning_rate × (∂L/∂θ) / (∂²L/∂θ²)
+5. **Bayesian prior**: Add Gaussian centered at 0.5 to regularize early estimates
+
+### Question Selection (Maximum Fisher Information)
+
+Fisher Information measures how much an item tells us about θ:
+
+```
+I(θ) = a² × [(P - c)² / ((1-c)² × P × Q)]
+```
+
+We select the question that maximizes I(θ) at the current ability estimate - this is information-theoretically optimal for CAT.
+
+---
+
+## Technology Stack
+
+| Layer | Technology | Purpose |
+|-------|------------|---------|
+| Backend | Python 3.9+ | Runtime |
+| Framework | FastAPI | REST API |
+| Database | MongoDB / In-Memory | Persistence |
+| ORM | Motor (async) | MongoDB driver |
+| Validation | Pydantic v2 | Schema validation |
+| AI/LLM | OpenAI GPT-4o-mini | Study plan generation |
+| Frontend | Vanilla JS | SPA UI |
+| Styling | Custom CSS | Dark theme |
+
+---
+
+## Configuration
+
+Environment variables (`.env`):
+
+```bash
+# Database
+MONGODB_URI=mongodb://localhost:27017
+DATABASE_NAME=adaptive_engine
+
+# OpenAI (optional - for AI study plans)
+OPENAI_API_KEY=sk-...
+
+# Application
+APP_HOST=0.0.0.0
+APP_PORT=8000
+APP_DEBUG=true
+
+# Adaptive Test Settings
+MAX_QUESTIONS_PER_SESSION=10
+INITIAL_ABILITY=0.5
+```
+
+---
+
+## Execution Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         APPLICATION LIFECYCLE                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. SERVER STARTUP                                                         │
+│     ├── Load .env configuration                                            │
+│     ├── Connect to MongoDB OR initialize in-memory DB                      │
+│     ├── Auto-seed questions (25 GRE-style questions)                       │
+│     └── Start uvicorn server                                               │
+│                                                                             │
+│  2. USER VISITS FRONTEND                                                   │
+│     ├── Browser loads index.html                                           │
+│     ├── JavaScript initializes state                                       │
+│     └── User enters name, selects question count                           │
+│                                                                             │
+│  3. SESSION CREATION                                                       │
+│     ├── POST /api/sessions                                                 │
+│     ├── Server creates session with θ = 0.5                                │
+│     ├── Returns session_id                                                 │
+│                                                                             │
+│  4. QUESTION FLOW (Loop)                                                   │
+│     ├── GET /api/sessions/{id}/next-question                              │
+│     ├── Server selects question via Fisher Information                     │
+│     ├── Returns question (without correct answer)                          │
+│     ├── User reads and selects answer                                      │
+│     ├── POST /api/sessions/{id}/submit-answer                              │
+│     ├── Server evaluates answer                                            │
+│     ├── Server updates θ via IRT MLE                                        │
+│     ├── Server updates session in DB                                        │
+│     ├── Returns result with updated ability                                │
+│     └── If not complete, repeat from step 4                               │
+│                                                                             │
+│  5. SESSION COMPLETION                                                      │
+│     ├── Server detects questions_answered >= max_questions                 │
+│     ├── Server calls LLM for study plan (if API key)                      │
+│     ├── Server stores study plan                                           │
+│     ├── User navigates to results screen                                   │
+│     ├── GET /api/sessions/{id}/summary                                    │
+│     └── Server returns full summary with study plan                       │
+│                                                                             │
+│  6. USER CAN START NEW SESSION                                             │
+│     └── Repeat from step 3                                                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Error Handling
+
+| Error | Cause | Response |
+|-------|-------|----------|
+| 400 | Invalid session/question ID | "Invalid ID format" |
+| 404 | Session/question not found | "Not found" |
+| 400 | Session not active | "Session is completed" |
+| 400 | Already answered | "Question already answered" |
+| 503 | Database connection failed | "Database connection failed" |
+
+All errors return JSON: `{detail: "error message"}`
+
+---
+
+## Security Considerations
+
+- **CORS**: Configured to allow all origins (`allow_origins=["*"]`) for development
+- **Input Validation**: All inputs validated via Pydantic schemas
+- **MongoDB Injection**: Using Motor's parameterized queries
+- **API Keys**: Stored in environment variables, never committed to git
+
+---
+
+## Performance Notes
+
+- **In-Memory DB**: Resets on server restart (use MongoDB for persistence)
+- **N+1 Queries**: Fixed with batch query for response history
+- **Session Limit**: Default 10 questions, max 25
+- **Question Bank**: 25 seeded questions across 8 topics
+
+---
+
+## Extending the System
+
+### Adding New Topics
+1. Add topic to `Topic` enum in `models.py`
+2. Add questions to `seed.py` with new topic
+3. Re-run seeding
+
+### Adding IRT Parameters
+Questions already have `discrimination` and `guessing` parameters built-in.
+
+### Changing Algorithm
+- Modify `adaptive_engine.py` for different IRT models (1PL, 2PL, 3PL)
+- Adjust blending ratio in `routes.py` for different feel
+
+### Adding Authentication
+1. Add user authentication (e.g., JWT)
+2. Add user_id to session schema
+3. Filter sessions by user_id
